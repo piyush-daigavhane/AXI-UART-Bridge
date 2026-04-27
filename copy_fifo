@@ -1,0 +1,80 @@
+`timescale 1ns / 1ps
+
+module copy_fifo( 
+output reg rd_en,      // goes to sync_fifo
+input  [7:0]  buf_out, //comes from sync_fifo
+input baud_clk,rst,
+output reg [3:0]AWID,
+output reg [31:0] ADDR,
+output reg [1:0] Burst_ty,
+output reg [2:0] Burst_size,
+output reg [3:0] Burst_len,
+input logic buf_empty,  //  comes from sync_fifo
+output logic  info_ready
+//output  logic  AWVALID
+);
+reg  [63:0] fifo_flat;
+logic        done;
+logic [3:0]  byte_index;
+logic [11:0] delay;   // to provide flag to register
+logic        flag;
+
+
+always_ff@(posedge baud_clk or posedge rst) begin 
+ if(rst)
+     delay <= 12'b0;  
+ else 
+     delay <= {delay[10:0],buf_empty};
+end
+
+assign flag = delay[11];
+
+ always_ff @(posedge flag or posedge rst) begin
+  
+  if (rst) begin
+    fifo_flat  <= 64'd0;
+    byte_index <= 0;
+    rd_en      <= 0;
+    done <=0;
+   end
+
+
+  else begin
+    if (!done ) begin
+      rd_en <= 1;
+
+      fifo_flat <= {buf_out,fifo_flat[63:8]};  // shift in new byte
+           byte_index <= byte_index + 1;
+
+      if (byte_index == 4'd8) begin
+        rd_en <= 0;
+        done  <= 1'b0;
+      end
+     end
+  end
+end
+
+always_ff@( posedge baud_clk or posedge rst) begin
+ if(rst) begin
+       AWID <=4'b0;
+       ADDR <= 32'b0;
+       Burst_ty <=2'b0;
+       Burst_size <=3'b0;
+       Burst_len <=5'b0;
+       info_ready <=1'b0;
+    // AWVALID    <=1'b0;
+  end
+
+ if (byte_index ==4'd9) begin
+	info_ready <=1'b1;
+//	AWVALID    <=1'b1;
+        AWID       <= fifo_flat[11:8];
+        ADDR       <= fifo_flat[43:12];
+        Burst_ty   <= fifo_flat[45:44];
+        Burst_size <= fifo_flat[48:46];
+        Burst_len  <= fifo_flat[52:49];
+       
+      end
+end
+
+endmodule
