@@ -1,0 +1,228 @@
+module burst_fixed #(
+    parameter int DATA_BUS_BYTE = 4,
+    parameter int ADDR_WIDTH    = 32
+)(
+    input  logic                     clk,
+    input  logic                     rst,
+
+    input  logic                     burst_start,
+    input  logic [1:0]               burst_type,  // only 2'b00 supported
+    input  logic [2:0]               burst_size,  // 0,1,2,3...
+    input  logic [3:0]               burst_len,   // beats-1
+    input  logic [ADDR_WIDTH-1:0]    start_address,
+
+    // FIFO 1-byte interface
+    input  logic                     o_rempty,
+    input  logic [7:0]               fifo_data,
+    output logic                     read_en,
+
+    // AXI W-channel
+    output logic [DATA_BUS_BYTE*8-1:0] wdata,
+    output logic [DATA_BUS_BYTE-1:0]   wstrb,
+    output logic                       wvalid,
+    output logic                       wlast,
+    input  logic                       wready
+);
+
+    localparam int DBY = DATA_BUS_BYTE;
+    
+    // Module-level signal declarations
+    logic [3:0] number_bytes;
+    logic [3:0] lower_lane, upper_lane;
+    logic [3:0] valid_bytes_needed;
+    logic [DBY-1:0] wstrb_reg;
+    
+    // State machine signals
+    typedef enum logic [1:0] {S_IDLE, S_FETCH, S_TRANSFER} state_t;
+    state_t state, nxt;
+    
+    // Counters and control signals
+    logic [3:0] beat_cnt;
+    logic [2:0] byte_cnt;        // Counts actual FIFO reads
+    logic       data_ready;
+    logic       fetch_enable;    // Controls when fetching is allowed
+    
+    // Data register
+    logic [DBY*8-1:0] wdata_reg;
+    
+    // signals for lane finding
+    logic [2:0] current_valid_lane;
+    logic [2:0] valid_lane_count;
+    
+    // Derived assignments
+    assign number_bytes = 1 << burst_size;
+    
+    // Function to count number of 1s in WSTRB
+    function automatic [3:0] count_wstrb_ones;
+        input [DBY-1:0] strb;
+        logic [3:0] count;
+        begin
+            count = 0;
+            for (int i = 0; i < DBY; i++) begin
+                if (strb[i]) count = count + 1;
+            end
+            count_wstrb_ones = count;
+        end
+    endfunction
+    
+    // Function to find the Nth valid lane (where WSTRB[i] = 1)
+    function automatic [2:0] find_nth_valid_lane;
+        input [DBY-1:0] strb;
+        input [2:0] n;
+        logic [2:0] count;
+        logic [2:0] result;
+        begin
+            count = 0;
+            result = 0;
+            for (int i = 0; i < DBY; i++) begin
+                if (strb[i]) begin
+                    if (count == n) begin
+                        result = i;
+                    end
+                    count = count + 1;
+                end
+            end
+            find_nth_valid_lane = result;
+        end
+    endfunction
+    
+    always_comb begin
+        // Calculate byte lanes (constant for whole FIXED burst)
+        lower_lane = start_address % DBY;
+        upper_lane = lower_lane + number_bytes - 1;
+        
+        // Generate WSTRB
+        for (int i = 0; i < DBY; i++) begin
+            wstrb_reg[i] = (i >= lower_lane) && (i <= upper_lane);
+        end
+        
+        // Count valid bytes needed (only lanes with WSTRB[i] = 1)
+        valid_bytes_needed = count_wstrb_ones(wstrb_reg);
+        
+        // Find current valid lane for data placement
+        current_valid_lane = find_nth_valid_lane(wstrb_reg, byte_cnt);
+    end
+    
+    // AXI output assignments
+    assign wstrb = wstrb_reg;
+    assign wdata = data_ready ? wdata_reg : '0;
+    assign wvalid = (state == S_TRANSFER) && data_ready;
+    assign wlast = (state == S_TRANSFER) && data_ready && (beat_cnt == burst_len);
+    
+    always_comb begin
+        nxt = state;
+        read_en = 1'b0;
+        
+        case (state)
+            S_IDLE: begin
+                if (burst_start && (burst_type == 2'b00)) begin
+                    nxt = S_FETCH;
+                end
+            end
+            
+            S_FETCH: begin
+                //Only assert read_en when:
+                //Fetching is enabled
+                //We need more valid bytes
+                //FIFO has data
+                if (fetch_enable && (byte_cnt < valid_bytes_needed) && !o_rempty) begin
+                    read_en = 1'b1;
+                end
+                
+                // Transition to transfer when all bytes are collected
+                if (byte_cnt >= valid_bytes_needed) begin
+                    nxt = S_TRANSFER;
+                end
+            end
+            
+            S_TRANSFER: begin
+                // Wait for AXI handshake
+                if (wvalid && wready) begin
+                    if (beat_cnt == burst_len) begin
+                        nxt = S_IDLE;
+                    end else begin
+                        nxt = S_FETCH;
+                    end
+                end
+            end
+            
+            default: nxt = S_IDLE;
+        endcase
+    end
+    
+    always_ff @(posedge clk or posedge rst) begin
+        if (rst) begin
+            state <= S_IDLE;
+            beat_cnt <= 0;
+            byte_cnt <= 0;
+            data_ready <= 1'b0;
+            fetch_enable <= 1'b0;
+            wdata_reg <= '0;
+        end else begin
+            // Update state
+            state <= nxt;
+            
+            case (state)
+                S_IDLE: begin
+                    if (nxt == S_FETCH) begin
+                        // Starting new burst
+                        beat_cnt <= 0;
+                        byte_cnt <= 0;
+                        data_ready <= 1'b0;
+                        fetch_enable <= 1'b1;  // Enable fetching
+                        
+                        // Initialize all lanes to zero
+                        wdata_reg <= '0;
+                    end
+                end
+                
+                S_FETCH: begin
+                    // Capture data when read_en is asserted and FIFO provides data
+                    if (read_en && !o_rempty) begin
+                        // Place data in the correct valid lane
+                        wdata_reg[current_valid_lane*8 +: 8] <= fifo_data;
+                        byte_cnt <= byte_cnt + 1;
+                        
+                        // Check if all valid bytes are collected
+                        if (byte_cnt == valid_bytes_needed - 1) begin
+                            data_ready <= 1'b1;
+                            fetch_enable <= 1'b0;  // Stop fetching
+                        end
+                    end
+                end
+                
+                S_TRANSFER: begin
+                    // Handle AXI handshake completion
+                    if (wvalid && wready  ) begin
+                        data_ready <= 1'b0;
+                        
+                        if (beat_cnt == burst_len) begin
+                            // End of burst
+                            beat_cnt <= 0;
+                            byte_cnt <= 0;
+                            fetch_enable <= 1'b0;
+                            wdata_reg <= '0;
+                        end else begin
+                            // Prepare for next beat
+                            beat_cnt <= beat_cnt + 1;
+                            byte_cnt <= 0;
+                            fetch_enable <= 1'b1;  // Enable fetching for next beat
+                            
+                            // Keep valid lanes, clear invalid ones
+                            for (int i = 0; i < DBY; i++) begin
+                                if (!wstrb_reg[i]) begin
+                                    wdata_reg[i*8 +: 8] <= 8'h00;
+                                end
+                            end
+                        end
+                    end
+                end
+                
+                default: begin
+                    state <= S_IDLE;
+                end
+            endcase
+        end
+    end
+
+endmodule
