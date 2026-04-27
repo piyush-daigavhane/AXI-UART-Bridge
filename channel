@@ -1,0 +1,64 @@
+`timescale 1ns/1ps
+
+module  channel (
+	input clk,
+	input rst,
+	input wire [3:0] AWID_r,
+        input wire [31:0] ADDR_r,
+        input wire [1:0] Burst_ty,
+	input wire [2:0] Burst_size,
+	input wire [4:0] Burst_len,
+	input            address_val,
+      // r to indicate value is coming from flat register
+	input wire       AWREADY,
+
+// outputs for address channel
+	output logic [3:0]  AWID,
+	output logic [31:0] AWADDR,
+        output logic [3:0]  AWLEN,
+	output logic [2:0]  AWSIZE,
+        output logic [1:0]  AWBURST,
+	output logic        AWVALID,
+
+// WRITE DATA Channel
+    input logic     [31:0] wdata,
+    input logic [3:0]   wstrb,
+    input logic        WVALID,
+    input logic        wlast,
+    input logic        WREADY,
+    output logic    [31:0] WDATA,
+    output logic    [3:0]  WSTRB,
+    output logic          WLAST           
+   
+);
+
+//  Write Address Channel //
+
+always_ff @(posedge clk or posedge rst) begin
+ if(rst) begin
+   AWID       <= 4'b0;
+    AWADDR    <=  32'b0;;
+    AWLEN     <=  5'b0;
+    AWSIZE    <=  3'b0;
+    AWBURST   <=  2'b0;
+end
+
+
+  if(address_val && AWREADY) begin
+    AWID      <=  AWID_r;
+    AWADDR    <=  ADDR_r;
+    AWLEN     <=  Burst_len;
+    AWSIZE    <=  Burst_size;
+    AWBURST   <=  Burst_ty;
+   end
+end
+    
+// Write Data Channel //
+always_ff @(posedge clk or posedge rst) begin
+ if(WREADY && WVALID) begin
+     WDATA    <= wdata;
+     WSTRB    <= wstrb;
+     WLAST    <= wlast;
+end
+end
+endmodule
